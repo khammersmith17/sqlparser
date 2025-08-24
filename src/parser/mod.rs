@@ -1,12 +1,75 @@
-pub mod record;
-use record::Record;
-use record::Value;
+use crate::Record;
+use crate::Value;
+use crate::data_containers::schema::{
+    IndexColumn, PrimaryKey, SQLiteColumnConstraints, SQLiteColumnType, TableColumn,
+};
+use anyhow::{Result, bail};
 use std::rc::Rc;
+mod tokenizer;
+use tokenizer::{SQLiteKeyword, SqlConditionToken, TokenStream};
 
-pub fn generate_condition_evaluator(condition: Option<Condition>) -> Box<dyn Fn(&Record) -> bool> {
+pub type FilterFn = Rc<dyn Fn(&Record) -> bool>;
+
+// utility to parse commas as seperators
+// accounting for the fact that there may be a comma in the
+// middle of a group
+struct GroupDepth {
+    paren_depth: usize,
+    single_qoute_depth: usize,
+    double_qoute_depth: usize,
+    bracket_depth: usize,
+    depth: usize,
+}
+
+impl GroupDepth {
+    fn new() -> GroupDepth {
+        GroupDepth {
+            paren_depth: 0_usize,
+            single_qoute_depth: 0_usize,
+            double_qoute_depth: 0_usize,
+            bracket_depth: 0_usize,
+            depth: 0_usize,
+        }
+    }
+
+    fn update(&mut self, token: char) {
+        // returns the max depth
+        match token {
+            '(' => self.paren_depth += 1,
+            '[' => self.bracket_depth += 1,
+            ']' => self.bracket_depth -= 1,
+            ')' => self.paren_depth += 1,
+            '\'' => {
+                if self.single_qoute_depth % 2 == 1 {
+                    self.single_qoute_depth -= 1
+                } else {
+                    self.single_qoute_depth += 1
+                }
+            }
+            '"' => {
+                if self.double_qoute_depth % 2 == 1 {
+                    self.double_qoute_depth -= 1
+                } else {
+                    self.double_qoute_depth += 1
+                }
+            }
+            _ => {}
+        }
+
+        self.depth = usize::max(
+            self.paren_depth,
+            usize::max(
+                self.bracket_depth,
+                usize::max(self.single_qoute_depth, self.double_qoute_depth),
+            ),
+        )
+    }
+}
+
+pub fn generate_condition_evaluator(condition: Option<Condition>) -> FilterFn {
     if let Some(cond) = condition {
         // closure that runs evaluate_record on the record and condition
-        Box::new(move |row: &Record| {
+        Rc::new(move |row: &Record| {
             let Some(res) = cond.evaluate_record(row) else {
                 return false;
             };
@@ -14,18 +77,62 @@ pub fn generate_condition_evaluator(condition: Option<Condition>) -> Box<dyn Fn(
         })
     } else {
         // closure the just returns true
-        Box::new(|_row: &Record| true)
+        Rc::new(|_row: &Record| true)
     }
 }
 
 #[derive(Debug, PartialEq)]
-pub struct BasicSelectStatement<'a> {
-    pub columns: Vec<&'a str>,
+pub struct BasicSelectStatementInner<'a> {
+    pub columns: Vec<String>,
     pub table: &'a str,
     pub condition: Option<Condition>,
 }
 
 #[derive(Debug, PartialEq)]
+pub struct BasicSelectStatement {
+    pub columns: Vec<String>,
+    pub table: String,
+    pub condition: Option<Condition>,
+}
+
+impl BasicSelectStatement {
+    pub fn new(sql_command: &str) -> Result<BasicSelectStatement> {
+        let parser = select_with_where();
+        let Ok((_, inner_sql_tree)) = parser.parse(sql_command) else {
+            bail!("Invalid sql statement")
+        };
+
+        let BasicSelectStatementInner {
+            columns: columns_inner,
+            table: table_inner,
+            condition,
+        } = inner_sql_tree;
+
+        let columns = columns_inner
+            .into_iter()
+            .map(|s| s.to_string().to_uppercase())
+            .collect::<Vec<String>>();
+
+        let table = table_inner.to_string().to_uppercase();
+
+        Ok(BasicSelectStatement {
+            columns,
+            table,
+            condition,
+        })
+    }
+
+    pub fn condition_columns(&self) -> Option<Vec<String>> {
+        if let Some(ref cond) = self.condition {
+            let cond_cols = cond.columns_evaluated_in_condition();
+            Some(cond_cols)
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Clone)]
 pub enum Condition {
     Column(String),
     Value(Value),
@@ -37,6 +144,20 @@ pub enum Condition {
 }
 
 impl Condition {
+    pub fn columns_evaluated_in_condition(&self) -> Vec<String> {
+        // recursivly walk the condition tree and fetch all the columns needed for the query
+        let mut columns: Vec<String> = Vec::new();
+        match self {
+            Self::Operation { left, right, .. } => {
+                columns.extend(left.columns_evaluated_in_condition());
+                columns.extend(right.columns_evaluated_in_condition())
+            }
+            Self::Column(ref v) => columns.push(v.to_uppercase()),
+            _ => {}
+        }
+        columns
+    }
+
     pub fn evaluate_record(&self, row: &Record) -> Option<bool> {
         // if left and right are Column/Value then evalute the condition
         // we should not get down to a Column/Value
@@ -220,7 +341,7 @@ where
 
 fn parse_for_select<'a>() -> impl Parser<'a, &'a str> {
     BoxedParser::new(|input| {
-        let keyword = "select";
+        let keyword = "SELECT";
 
         let (head, rest) = input.split_at(keyword.len());
 
@@ -232,13 +353,13 @@ fn parse_for_select<'a>() -> impl Parser<'a, &'a str> {
     })
 }
 
-fn parse_for_where<'a>() -> impl Parser<'a, &'a str> {
+fn _parse_for_where<'a>() -> impl Parser<'a, &'a str> {
     BoxedParser::new(|input| {
-        let keyword = "where";
+        let keyword = "WHERE";
 
         let (head, rest) = input.split_at(keyword.len());
 
-        if head.eq_ignore_ascii_case(head) {
+        if head.eq_ignore_ascii_case(keyword) {
             Ok((rest, keyword))
         } else {
             Err("Invalid query syntax".into())
@@ -326,17 +447,17 @@ fn parse_for_condition_column<'a>() -> impl Parser<'a, Condition> {
             return Err("not an identifer".into());
         };
 
-        Ok((next, Condition::Column(res.into())))
+        Ok((next, Condition::Column(res.to_uppercase())))
     })
 }
 
 fn parse_for_from<'a>() -> impl Parser<'a, &'a str> {
     BoxedParser::new(|input| {
-        let keyword = "from";
+        let keyword = "FROM";
 
         let (head, rest) = input.split_at(keyword.len());
 
-        if head.eq_ignore_ascii_case(head) {
+        if head.eq_ignore_ascii_case(keyword) {
             Ok((rest, keyword))
         } else {
             Err("Invalid query syntax".into())
@@ -372,7 +493,7 @@ fn parse_for_whitespace<'a>() -> impl Parser<'a, ()> {
         let len = input.len();
         let mut end = 0_usize;
         for c in input.bytes() {
-            if c == 32 {
+            if matches!(c, 32 | 9 | 10 | 11 | 12 | 13) {
                 end += 1
             } else {
                 break;
@@ -380,7 +501,7 @@ fn parse_for_whitespace<'a>() -> impl Parser<'a, ()> {
         }
 
         if end == len {
-            Err("Expected a space".into())
+            Ok((input, ()))
         } else {
             Ok((&input[end..], ()))
         }
@@ -432,6 +553,14 @@ fn parse_for_operator<'a>() -> impl Parser<'a, Operator> {
         }
     })
 }
+/*
+* Start at or predence level
+*   - parse for OR and split
+* Pass each new blob down to the AND precednece level
+*   - parse for AND and split
+* parse for binary operators
+* then construct the AST from the bottom up
+* */
 
 fn fold_conditions(op: Operator, conditions: Vec<Condition>) -> Option<Condition> {
     let mut cond_iter = conditions.into_iter();
@@ -586,6 +715,433 @@ where
     })
 }
 
+fn parse_for_keyword<'a>(keyword: &'a str) -> impl Parser<'a, ()> {
+    BoxedParser::new(move |input| {
+        let klen = keyword.len();
+        if input.len() < klen {
+            return Err(format!("expected {}", keyword));
+        };
+        let (head, rest) = input.split_at(keyword.len());
+
+        if head.eq_ignore_ascii_case(keyword) {
+            Ok((rest, ()))
+        } else {
+            Err(format!("expected {}", keyword))
+        }
+    })
+}
+
+fn _parse_for_create<'a>() -> impl Parser<'a, ()> {
+    parse_for_keyword("CREATE")
+}
+
+fn _parse_for_table<'a>() -> impl Parser<'a, ()> {
+    BoxedParser::new(|input| {
+        let target = "TABLE";
+
+        let (head, rest) = input.split_at(target.len());
+
+        if head.eq_ignore_ascii_case(target) {
+            Ok((rest, ()))
+        } else {
+            Err("expected TABLE".into())
+        }
+    })
+}
+
+fn parse_for_schema_multi_word_column_name<'a>() -> impl Parser<'a, &'a str> {
+    BoxedParser::new(move |input| {
+        let Some(mut start) = input.find('"') else {
+            return Err("Not a multi word column name".into());
+        };
+
+        start = start.saturating_add(1);
+
+        let Some(mut end) = &input[start..].find('"') else {
+            return Err("Not a multi word column name".into());
+        };
+
+        // index passed "
+        let new_start = end.saturating_add(2);
+        end += 1;
+
+        Ok((&input[new_start..], &input[start..end]))
+    })
+}
+
+fn parse_for_column_constraints<'a>() -> impl Parser<'a, Vec<SQLiteColumnConstraints>> {
+    // TODO: expand this to all possible constraint possiblities
+    BoxedParser::new(|input| {
+        let mut token_stream = TokenStream::new(input);
+        if token_stream.len() == 0 {
+            return Ok(("", Vec::new()));
+        }
+
+        let mut res: Vec<SQLiteColumnConstraints> = Vec::new();
+        while let Some(token) = token_stream.next() {
+            match token {
+                SqlConditionToken::Keyword(k) => match k {
+                    SQLiteKeyword::Primary => {
+                        if matches!(
+                            token_stream.peek(),
+                            Some(&SqlConditionToken::Keyword(SQLiteKeyword::Key))
+                        ) {
+                            res.push(SQLiteColumnConstraints::PrimaryKey);
+                            let _ = token_stream.next();
+                        } else {
+                            return Err("Invalid conditon".into());
+                        }
+                    }
+                    SQLiteKeyword::Not => {
+                        if matches!(
+                            token_stream.peek(),
+                            Some(&SqlConditionToken::Keyword(SQLiteKeyword::Null))
+                        ) {
+                            res.push(SQLiteColumnConstraints::NotNull);
+                            let _ = token_stream.next();
+                        } else {
+                            return Err("Invalid conditon".into());
+                        }
+                    }
+                    SQLiteKeyword::AutoIncrement => {
+                        res.push(SQLiteColumnConstraints::AutoIncrement)
+                    }
+                    SQLiteKeyword::Collate => {
+                        let Some(collation_condition) = token_stream.next() else {
+                            return Err("Invalid collalition".into());
+                        };
+
+                        let c_str = match collation_condition {
+                            SqlConditionToken::StringGroup(v) => v,
+                            SqlConditionToken::Identifier(v) => v,
+                            SqlConditionToken::QuotedIdentifier(v) => v,
+                            _ => return Err("Invalid collation".into()),
+                        };
+                        res.push(SQLiteColumnConstraints::Collate(c_str.to_string()));
+                    }
+                    SQLiteKeyword::Ascending => res.push(SQLiteColumnConstraints::Ascending),
+                    SQLiteKeyword::Descending => res.push(SQLiteColumnConstraints::Descending),
+                    _ => todo!(),
+                },
+                _ => todo!(),
+            }
+        }
+
+        Ok(("", res))
+    })
+}
+
+fn parse_for_string_group<'a>() -> impl Parser<'a, &'a str> {
+    BoxedParser::new(|input| {
+        let mut chars = input.chars();
+
+        let Some(first) = chars.next() else {
+            return Err("Invalid string group".into());
+        };
+
+        if first != '"' {
+            return Err("Invalid string group".into());
+        }
+
+        let start = 1_usize;
+        let mut end = start;
+
+        for c in chars {
+            if c == '"' {
+                break;
+            }
+            end += 1;
+        }
+
+        Ok((&input[end + 1..], &input[start..end]))
+    })
+}
+
+fn parse_column_type<'a>() -> impl Parser<'a, Option<SQLiteColumnType>> {
+    let parser = parse_for_identifiers();
+    BoxedParser::new(move |input| {
+        if input.is_empty() {
+            return Ok(("", None));
+        };
+        let Ok((rest, type_str)) = parser.parse(input) else {
+            return Err("No identifier found".into());
+        };
+
+        let Ok(dtype) = SQLiteColumnType::try_from(type_str) else {
+            return Err("Invalid type".into());
+        };
+
+        Ok((rest, Some(dtype)))
+    })
+}
+
+fn parse_table_column_definition<'a>() -> impl Parser<'a, TableColumn> {
+    parse_for_whitespace() // white space
+        .then(parse_for_schema_multi_word_column_name().or(parse_for_identifiers())) // column name
+        .then(parse_for_whitespace())
+        .then(parse_column_type()) // type
+        .then(parse_for_column_constraints())
+        .map(|(((((), name), _), data_type), constraints)| TableColumn {
+            name: name.to_string(),
+            data_type,
+            constraints,
+        })
+}
+
+fn _parse_for_open_paren<'a>() -> impl Parser<'a, ()> {
+    BoxedParser::new(|input| {
+        let Some(start) = input.find('(') else {
+            return Err("No open paren found".into());
+        };
+
+        Ok((&input[start + 1..], ()))
+    })
+}
+
+fn _parse_for_closed_paren<'a>() -> impl Parser<'a, ()> {
+    BoxedParser::new(|input| {
+        let Some(start) = input.find(')') else {
+            return Err("No open paren found".into());
+        };
+
+        Ok((&input[start + 1..], ()))
+    })
+}
+
+fn parse_for_column_schema_group<'a>() -> impl Parser<'a, &'a str> {
+    BoxedParser::new(|input| {
+        let Some(mut start) = input.find('(') else {
+            return Err("Invalid schema".into());
+        };
+        start += 1;
+        let mut end = start;
+        let mut paren_depth = 1_usize;
+        let mut chars = input.chars();
+        let _ = chars.next();
+
+        // grab the inner token group
+        while let Some(next) = chars.next() {
+            match next {
+                '(' => paren_depth += 1,
+                ')' => paren_depth -= 1,
+                _ => {}
+            }
+            end += 1;
+            if paren_depth == 0 {
+                break;
+            }
+        }
+        Ok((&input[end..], &input[start..end - 1]))
+    })
+}
+
+fn parse_for_table_schema_columns<'a>() -> impl Parser<'a, Vec<TableColumn>> {
+    let col_parser = parse_table_column_definition();
+    let group_parser = parse_for_column_schema_group();
+    BoxedParser::new(move |mut input| {
+        let mut columns: Vec<TableColumn> = Vec::new();
+
+        let Ok((rest, col_tokens)) = group_parser.parse(input) else {
+            return Err("Invalid schema definition".into());
+        };
+
+        input = rest;
+
+        let mut group_depth = GroupDepth::new();
+        let mut line_start = 0_usize;
+        let mut line_end = 0_usize;
+        for token in col_tokens.chars() {
+            if group_depth.depth == 0 && token == ',' {
+                let Ok((_, column)) = col_parser.parse(&col_tokens[line_start..line_end]) else {
+                    return Err("Invalid colum definition".into());
+                };
+                columns.push(column);
+                line_start = line_end + 1;
+                line_end = line_start;
+            } else {
+                group_depth.update(token);
+                line_end += 1;
+            }
+        }
+
+        let Ok((_, column)) = col_parser.parse(&col_tokens[line_start..line_end]) else {
+            return Err("Invalid colum definition".into());
+        };
+
+        columns.push(column);
+
+        Ok((input, columns))
+    })
+}
+
+fn _parse_for_without_row_id<'a>() -> impl Parser<'a, bool> {
+    BoxedParser::new(|input| {
+        let token = "WITHOUT ROWID";
+        let token_len = token.len();
+        if input.len() < token_len {
+            return Ok((input, false));
+        }
+        let (head, rest) = input.split_at(token.len());
+
+        if head.eq_ignore_ascii_case(token) {
+            Ok((&rest, true))
+        } else {
+            Ok((&rest, false))
+        }
+    })
+}
+
+fn parse_for_optional_keyword<'a>(keyword: &'a str) -> impl Parser<'a, bool> {
+    BoxedParser::new(move |input| {
+        let keyword_len = keyword.len();
+        if input.len() < keyword_len {
+            return Ok((input, false));
+        }
+        let (head, rest) = input.split_at(keyword_len);
+
+        if head.eq_ignore_ascii_case(keyword) {
+            Ok((&rest, true))
+        } else {
+            Ok((input, false))
+        }
+    })
+}
+
+fn if_not_exists_parser<'a>() -> impl Parser<'a, bool> {
+    BoxedParser::new(|input| {
+        let keyword = "IF NOT EXISTS";
+        let len = keyword.len();
+        if input.len() < len {
+            return Ok((input, false));
+        }
+
+        let (head, rest) = input.split_at(len);
+
+        if head.eq_ignore_ascii_case(keyword) {
+            Ok((rest, true))
+        } else {
+            Ok((input, false))
+        }
+    })
+}
+
+fn parse_index_column_definition<'a>() -> impl Parser<'a, IndexColumn> {
+    parse_for_whitespace() // white space
+        .then(parse_for_schema_multi_word_column_name().or(parse_for_identifiers()))
+        .then(parse_for_whitespace())
+        .then(parse_for_column_constraints())
+        .map(|((((), name), _), constraints)| IndexColumn {
+            name: name.to_string(),
+            constraints,
+        })
+}
+
+fn parse_index_columns<'a>() -> impl Parser<'a, Vec<IndexColumn>> {
+    let paren_group_parser = parse_for_column_schema_group();
+    let col_parser = parse_index_column_definition();
+    BoxedParser::new(move |input| {
+        let mut index_columns: Vec<IndexColumn> = Vec::new();
+        let Ok((rest, col_tokens)) = paren_group_parser.parse(input) else {
+            return Err("Invalid schema".into());
+        };
+
+        let mut group_depth = GroupDepth::new();
+        let mut line_start = 0_usize;
+        let mut line_end = 0_usize;
+
+        for token in col_tokens.chars() {
+            if group_depth.depth == 0 && token == ',' {
+                let Ok((_, column)) = col_parser.parse(&col_tokens[line_start..line_end]) else {
+                    return Err("Invalid colum definition".into());
+                };
+                index_columns.push(column);
+                line_start = line_end + 1;
+                line_end = line_start;
+            } else {
+                group_depth.update(token);
+                line_end += 1;
+            }
+        }
+        let Ok((_, column)) = col_parser.parse(&col_tokens[line_start..line_end]) else {
+            return Err("Invalid colum definition".into());
+        };
+
+        index_columns.push(column);
+
+        Ok((rest, index_columns))
+    })
+}
+
+// TODO: add a parser for an index schema
+pub fn parse_index_schema<'a>() -> impl Parser<'a, (String, String, bool, Vec<IndexColumn>)> {
+    // CREATE
+    // INDEX
+    // optional IF NOT EXISTS
+    // index name
+    // ON
+    // base table name
+    // paren group
+    //      column name <Constraints>
+    parse_for_whitespace()
+        .then(parse_for_keyword("CREATE"))
+        .then(parse_for_whitespace())
+        .then(parse_for_optional_keyword("UNIQUE"))
+        .then(parse_for_whitespace())
+        .then(parse_for_keyword("INDEX"))
+        .then(parse_for_whitespace())
+        .then(if_not_exists_parser())
+        .then(parse_for_whitespace())
+        .then(parse_for_string_group().or(parse_for_identifiers()))
+        .then(parse_for_whitespace())
+        .then(parse_for_keyword("ON"))
+        .then(parse_for_whitespace())
+        .then(parse_for_string_group().or(parse_for_identifiers()))
+        .then(parse_for_whitespace())
+        .then(parse_index_columns())
+        .map(
+            |(
+                (
+                    (
+                        (
+                            ((((((((((((), _), _), unique), _), _), _), index_name), _), _), _), _),
+                            _,
+                        ),
+                        base_table_name,
+                    ),
+                    _,
+                ),
+                index_columns,
+            )| {
+                (
+                    index_name.to_string(),
+                    base_table_name.to_string(),
+                    unique,
+                    index_columns,
+                )
+            },
+        )
+}
+
+pub fn parse_table_schema<'a>() -> impl Parser<'a, (String, Vec<TableColumn>, PrimaryKey, bool)> {
+    parse_for_whitespace()
+        .then(parse_for_keyword("CREATE"))
+        .then(parse_for_whitespace())
+        .then(parse_for_keyword("TABLE"))
+        .then(parse_for_whitespace())
+        .then(parse_for_string_group().or(parse_for_identifiers()))
+        .then(parse_for_whitespace())
+        .then(parse_for_table_schema_columns())
+        .then(parse_for_whitespace())
+        .then(parse_for_optional_keyword("WITHOUT ROWID"))
+        .map(
+            |((((((((_, _), _), _), name), _), columns), _), without_rowid)| {
+                // parse for the primary key
+                let primary_key = PrimaryKey::from_table_columns(&columns);
+                (name.to_string(), columns, primary_key, without_rowid)
+            },
+        )
+}
+
 fn parse_for_columns<'a>() -> impl Parser<'a, Vec<&'a str>> {
     sep_by_two_seperators(
         parse_for_identifiers(),
@@ -600,7 +1156,7 @@ fn parse_for_columns<'a>() -> impl Parser<'a, Vec<&'a str>> {
     )
 }
 
-pub fn basic_select_statement<'a>() -> impl Parser<'a, BasicSelectStatement<'a>> {
+pub fn basic_select_statement<'a>() -> impl Parser<'a, BasicSelectStatementInner<'a>> {
     parse_for_select()
         .then(parse_for_whitespace())
         .then(parse_for_columns())
@@ -608,39 +1164,41 @@ pub fn basic_select_statement<'a>() -> impl Parser<'a, BasicSelectStatement<'a>>
         .then(parse_for_from())
         .then(parse_for_whitespace())
         .then(parse_for_identifiers())
-        .map(
-            |((((((_, _), columns), _), _), _), table)| BasicSelectStatement {
+        .map(|((((((_, _), base_cols), _), _), _), table)| {
+            let columns: Vec<String> = base_cols.into_iter().map(|c| c.to_uppercase()).collect();
+            BasicSelectStatementInner {
                 columns,
                 table,
                 condition: None,
-            },
-        )
+            }
+        })
 }
 
 fn parse_for_where_clause<'a>() -> impl Parser<'a, Option<Condition>> {
     parse_for_whitespace()
-        .then(parse_for_where())
+        .then(parse_for_keyword("WHERE"))
         .then(parse_for_condition())
         .map(|((_, _), condition)| condition)
         .or(BoxedParser::new(|input| Ok((input, None))))
 }
 
-pub fn select_with_where<'a>() -> impl Parser<'a, BasicSelectStatement<'a>> {
-    parse_for_select()
+pub fn select_with_where<'a>() -> impl Parser<'a, BasicSelectStatementInner<'a>> {
+    parse_for_keyword("SELECT")
         .then(parse_for_whitespace())
         .then(parse_for_columns())
         .then(parse_for_whitespace())
-        .then(parse_for_from())
+        .then(parse_for_keyword("FROM"))
         .then(parse_for_whitespace())
         .then(parse_for_identifiers())
         .then(parse_for_where_clause())
-        .map(
-            |(((((((_, _), columns), _), _), _), table), condition)| BasicSelectStatement {
+        .map(|(((((((_, _), base_cols), _), _), _), table), condition)| {
+            let columns: Vec<String> = base_cols.into_iter().map(|c| c.to_uppercase()).collect();
+            BasicSelectStatementInner {
                 columns,
                 table,
                 condition,
-            },
-        )
+            }
+        })
 }
 
 #[cfg(test)]
@@ -667,7 +1225,7 @@ mod test {
         let q = "Select * from table";
         let parser = parse_for_select();
         let res = parser.parse(q).unwrap();
-        assert_eq!(res, (" * from table", "select"))
+        assert_eq!(res, (" * from table", "SELECT"))
     }
 
     #[test]
@@ -698,8 +1256,8 @@ mod test {
     fn test_whole_parser() {
         let parser = basic_select_statement();
         let res = parser.parse("select column from table").unwrap();
-        let actual = BasicSelectStatement {
-            columns: ["column"].to_vec(),
+        let actual = BasicSelectStatementInner {
+            columns: ["column".into()].to_vec(),
             table: "table",
             condition: None,
         };
@@ -710,8 +1268,8 @@ mod test {
     fn multiple_columns() {
         let parser = basic_select_statement();
         let res = parser.parse("select column1, column2 from table").unwrap();
-        let actual = BasicSelectStatement {
-            columns: ["column1", "column2"].to_vec(),
+        let actual = BasicSelectStatementInner {
+            columns: ["column1".into(), "column2".into()].to_vec(),
             table: "table",
             condition: None,
         };
@@ -791,7 +1349,7 @@ mod test {
     fn test_parse_for_condition_identifer() {
         let parser = parse_for_condition_column();
         let res = parser.parse("thing = ").unwrap();
-        assert_eq!(res, (" = ", Condition::Column(String::from("thing"))));
+        assert_eq!(res, (" = ", Condition::Column(String::from("THING"))));
     }
 
     #[test]
@@ -803,7 +1361,7 @@ mod test {
             (
                 "",
                 Some(Condition::Operation {
-                    left: Box::new(Condition::Column(String::from("value"))),
+                    left: Box::new(Condition::Column(String::from("VALUE"))),
                     op: Operator::GreaterThanOrEqualTo,
                     right: Box::new(Condition::Value(Value::Int(42)))
                 })
@@ -847,5 +1405,34 @@ mod test {
 
         let is_met = condition.evaluate_record(&record);
         assert_eq!(is_met, Some(false));
+    }
+
+    #[test]
+    fn parse_for_multi_word_column_name() {
+        let parser = parse_for_schema_multi_word_column_name();
+
+        let (_, res) = parser.parse("\"SIZE RANGE\"").unwrap();
+        assert_eq!(res, String::from("SIZE RANGE"))
+    }
+
+    #[test]
+    fn test_column_def() {
+        let col_str = "id integer primary key autoincrement";
+
+        let col_parser = parse_table_column_definition();
+
+        let (_, col) = col_parser.parse(col_str).unwrap();
+        println!("col def: {:?}", col);
+    }
+
+    #[test]
+    fn test_condition_columns() {
+        let query = "SELECT id, name FROM companies WHERE country = 'micronesia'";
+
+        let parsed_query = BasicSelectStatement::new(query).unwrap();
+
+        let cols = parsed_query.condition_columns().unwrap();
+
+        assert_eq!(cols, vec!["COUNTRY"])
     }
 }

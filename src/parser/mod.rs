@@ -1,9 +1,9 @@
-use crate::Record;
-use crate::Value;
-use crate::data_containers::schema::{
-    IndexColumn, PrimaryKey, SQLiteColumnConstraints, SQLiteColumnType, TableColumn,
-};
+mod record;
+use record::Record;
+use record::Value;
+mod schema;
 use anyhow::{Result, bail};
+use schema::{IndexColumn, PrimaryKey, SQLiteColumnConstraints, SQLiteColumnType, TableColumn};
 use std::rc::Rc;
 mod tokenizer;
 use tokenizer::{SQLiteKeyword, SqlConditionToken, TokenStream};
@@ -152,7 +152,7 @@ impl Condition {
                 columns.extend(left.columns_evaluated_in_condition());
                 columns.extend(right.columns_evaluated_in_condition())
             }
-            Self::Column(ref v) => columns.push(v.to_uppercase()),
+            Self::Column(v) => columns.push(v.to_uppercase()),
             _ => {}
         }
         columns
@@ -757,7 +757,7 @@ fn parse_for_schema_multi_word_column_name<'a>() -> impl Parser<'a, &'a str> {
 
         start = start.saturating_add(1);
 
-        let Some(mut end) = &input[start..].find('"') else {
+        let Some(mut end) = input[start..].find('"') else {
             return Err("Not a multi word column name".into());
         };
 

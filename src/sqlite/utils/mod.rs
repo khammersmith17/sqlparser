@@ -1,3 +1,5 @@
+const SINGLE_BYTE_BIT_MAP: u8 = 0x80;
+
 pub fn parse_varint(bytes: Vec<u8>) -> usize {
     let mut result = 0_usize;
     for (i, b) in bytes.into_iter().enumerate() {
@@ -28,7 +30,6 @@ pub fn traverse_record(record: &[u8], mut record_i: usize) -> Vec<u8> {
 }
 
 // offset shift, evaluated_varint
-#[allow(unused)]
 pub fn parse_sqlite_varint(buffer: &[u8], start_offset: usize) -> (usize, usize) {
     let mut offset = start_offset;
     let mut varint = 0_usize;

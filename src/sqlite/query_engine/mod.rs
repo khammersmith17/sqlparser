@@ -1,18 +1,18 @@
 use crate::{
-    data_containers::{
+    parser::{BasicSelectStatement, Condition, FilterFn, generate_condition_evaluator},
+    sqlite::data_containers::{
+        headers::DatabaseHeader,
+        page::Page,
         page::{
-            read_index_interior_page, read_index_leaf_page, scan_interior_table_page,
-            scan_leaf_table_page, PageType,
+            PageType, read_index_interior_page, read_index_leaf_page, scan_interior_table_page,
+            scan_leaf_table_page,
         },
-        record::{InteriorTablePageRecord, TableRecordLabel},
-        schema::{IndexMetadata, IndexRowRef},
+        record::{InteriorTablePageRecord, TableRecord, TableRecordLabel},
+        schema::{IndexMetadata, IndexRowRef, SqliteSchema},
     },
-    generate_condition_evaluator,
-    sql::{Condition, FilterFn},
-    utils::{parse_sqlite_varint, SqliteVarint},
-    BasicSelectStatement, DatabaseHeader, Page, SqliteSchema, TableRecord,
+    sqlite::utils::{SqliteVarint, parse_sqlite_varint},
 };
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use std::cmp::Ordering;
 use std::fs::File;
 mod search;
@@ -23,7 +23,7 @@ fn plan_query<'a>(
     db_schema: &'a SqliteSchema,
     table_name: &str,
 ) -> Option<&'a IndexMetadata> {
-    let Some(ref cond) = query_condition else {
+    let Some(cond) = query_condition else {
         return None;
     };
 

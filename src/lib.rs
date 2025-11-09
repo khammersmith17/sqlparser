@@ -1,2 +1,2 @@
-mod parser;
-mod sqlite;
+pub mod parser;
+pub mod sqlite;

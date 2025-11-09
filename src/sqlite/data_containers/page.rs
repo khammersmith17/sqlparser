@@ -1,9 +1,9 @@
 use super::headers::DatabaseHeader;
-use crate::data_containers::record::{IndexRecord, TableRecord, Value};
-use crate::data_containers::schema::{IndexMetadata, IndexRowRef, TableMetadata};
-use crate::sql::FilterFn;
-use crate::utils::{parse_sqlite_varint, SqliteVarint};
-use anyhow::{bail, Result};
+use crate::parser::FilterFn;
+use crate::sqlite::data_containers::record::{IndexRecord, TableRecord, Value};
+use crate::sqlite::data_containers::schema::{IndexMetadata, IndexRowRef, TableMetadata};
+use crate::sqlite::utils::{SqliteVarint, parse_sqlite_varint};
+use anyhow::{Result, bail};
 use std::fs::File;
 use std::io::{Read, Seek};
 // container for the page metadata

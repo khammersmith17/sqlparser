@@ -1,4 +1,4 @@
-use crate::data_containers::{record::TableRecordLabel, schema::IndexRowRef};
+use crate::sqlite::data_containers::{record::TableRecordLabel, schema::IndexRowRef};
 use std::cmp::Ordering;
 
 #[allow(unused)]

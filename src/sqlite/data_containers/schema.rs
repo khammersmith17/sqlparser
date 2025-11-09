@@ -1,11 +1,11 @@
 use super::page::PageHeader;
+use super::record::Value;
 use super::serial_types::SerialType;
-use crate::data_containers::record::Value;
-use crate::sql::{parse_index_schema, parse_table_schema, Condition, Parser};
-use crate::utils::{
-    construct_base_column_bit_set, generate_column_bitmask, read_varint, SqliteVarint,
+use crate::parser::{Condition, Parser, parse_index_schema, parse_table_schema};
+use crate::sqlite::utils::{
+    SqliteVarint, construct_base_column_bit_set, generate_column_bitmask, read_varint,
 };
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use std::cmp::{Ordering, PartialOrd};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;

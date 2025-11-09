@@ -1,14 +1,14 @@
-mod record;
-use record::Record;
-use record::Value;
-mod schema;
+use crate::sqlite::data_containers::record::SQLiteRecord;
+use crate::sqlite::data_containers::{
+    record::Value,
+    schema::{IndexColumn, PrimaryKey, SQLiteColumnConstraints, SQLiteColumnType, TableColumn},
+};
 use anyhow::{Result, bail};
-use schema::{IndexColumn, PrimaryKey, SQLiteColumnConstraints, SQLiteColumnType, TableColumn};
 use std::rc::Rc;
 mod tokenizer;
 use tokenizer::{SQLiteKeyword, SqlConditionToken, TokenStream};
 
-pub type FilterFn = Rc<dyn Fn(&Record) -> bool>;
+pub type FilterFn = Rc<dyn Fn(&dyn SQLiteRecord) -> bool>;
 
 // utility to parse commas as seperators
 // accounting for the fact that there may be a comma in the
@@ -69,7 +69,7 @@ impl GroupDepth {
 pub fn generate_condition_evaluator(condition: Option<Condition>) -> FilterFn {
     if let Some(cond) = condition {
         // closure that runs evaluate_record on the record and condition
-        Rc::new(move |row: &Record| {
+        Rc::new(move |row: &dyn SQLiteRecord| {
             let Some(res) = cond.evaluate_record(row) else {
                 return false;
             };
@@ -77,7 +77,7 @@ pub fn generate_condition_evaluator(condition: Option<Condition>) -> FilterFn {
         })
     } else {
         // closure the just returns true
-        Rc::new(|_row: &Record| true)
+        Rc::new(|_row: &dyn SQLiteRecord| true)
     }
 }
 
@@ -124,11 +124,15 @@ impl BasicSelectStatement {
 
     pub fn condition_columns(&self) -> Option<Vec<String>> {
         if let Some(ref cond) = self.condition {
-            let cond_cols = cond.columns_evaluated_in_condition();
+            let cond_cols = cond.evaluated_columns();
             Some(cond_cols)
         } else {
             None
         }
+    }
+
+    pub fn select_columns(&self) -> Vec<String> {
+        self.columns.clone()
     }
 }
 
@@ -144,13 +148,13 @@ pub enum Condition {
 }
 
 impl Condition {
-    pub fn columns_evaluated_in_condition(&self) -> Vec<String> {
+    pub fn evaluated_columns(&self) -> Vec<String> {
         // recursivly walk the condition tree and fetch all the columns needed for the query
         let mut columns: Vec<String> = Vec::new();
         match self {
             Self::Operation { left, right, .. } => {
-                columns.extend(left.columns_evaluated_in_condition());
-                columns.extend(right.columns_evaluated_in_condition())
+                columns.extend(left.evaluated_columns());
+                columns.extend(right.evaluated_columns())
             }
             Self::Column(v) => columns.push(v.to_uppercase()),
             _ => {}
@@ -158,7 +162,7 @@ impl Condition {
         columns
     }
 
-    pub fn evaluate_record(&self, row: &Record) -> Option<bool> {
+    pub fn evaluate_record(&self, row: &dyn SQLiteRecord) -> Option<bool> {
         // if left and right are Column/Value then evalute the condition
         // we should not get down to a Column/Value
         match self {
@@ -176,9 +180,9 @@ impl Condition {
         }
     }
 
-    fn resolve(&self, row: &Record) -> Option<Value> {
+    fn resolve(&self, row: &dyn SQLiteRecord) -> Option<Value> {
         match self {
-            Self::Column(c) => row.row_values.get(c).cloned(),
+            Self::Column(c) => row.record_values().get(c).cloned(),
             Self::Value(v) => Some(v.clone()),
             Self::Operation { .. } => Some(Value::Bool(self.evaluate_record(row)?)),
         }
@@ -882,7 +886,7 @@ fn parse_table_column_definition<'a>() -> impl Parser<'a, TableColumn> {
         .then(parse_column_type()) // type
         .then(parse_for_column_constraints())
         .map(|(((((), name), _), data_type), constraints)| TableColumn {
-            name: name.to_string(),
+            name: name.to_uppercase(),
             data_type,
             constraints,
         })
@@ -1031,7 +1035,7 @@ fn parse_index_column_definition<'a>() -> impl Parser<'a, IndexColumn> {
         .then(parse_for_whitespace())
         .then(parse_for_column_constraints())
         .map(|((((), name), _), constraints)| IndexColumn {
-            name: name.to_string(),
+            name: name.to_uppercase(),
             constraints,
         })
 }
@@ -1204,6 +1208,7 @@ pub fn select_with_where<'a>() -> impl Parser<'a, BasicSelectStatementInner<'a>>
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::sqlite::data_containers::record::TableRecord;
 
     #[test]
     fn test_single() {
@@ -1398,7 +1403,7 @@ mod test {
         let mut row_values: std::collections::HashMap<String, Value> =
             std::collections::HashMap::new();
         row_values.insert(String::from("value"), Value::Int(50));
-        let record = Record {
+        let record = TableRecord {
             record_id: 0,
             row_values,
         };

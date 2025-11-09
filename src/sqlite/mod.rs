@@ -1,5 +1,4 @@
 pub mod data_containers;
-pub mod header;
 pub mod query_engine;
 pub mod utils;
 
